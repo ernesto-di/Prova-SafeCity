@@ -1,281 +1,101 @@
 import carla
-import math
-import time
 import config
 import utils
+from smart_intersection import SmartIntersection
+from ai_logic import ai_brain_decision
 
-class SmartIntersection:
-    def __init__(self, junction_id, lights, world):
-        self.junction_id = junction_id
+class TrafficLightManager:
+    def __init__(self, world):
         self.world = world
-        self.light_groups = {'N': [], 'S': [], 'E': [], 'O': []}
-        self.phase_to_dir = {0: 'N', 1: 'S', 2: 'E', 3: 'O'}
-        self.vehicle_stop_times = {}  # {vehicle_id: timestamp_start_waiting}
-        self.is_blocked = False  # Stato occupazione incrocio
+        self.intersections = []
+        self.last_print_time = 0
+        self._scan_intersections()
 
-        x_coords = [tl.get_location().x for tl in lights]
-        y_coords = [tl.get_location().y for tl in lights]
-        self.center = carla.Location(x=sum(x_coords) / len(x_coords), y=sum(y_coords) / len(y_coords), z=0.5)
+    def _scan_intersections(self):
+        # 1. Recupera TUTTI i semafori della mappa
+        all_tls = self.world.get_actors().filter('traffic.traffic_light')
 
-        # Calcolo raggio dinamico del Box Junction (distanza minima semaforo dal centro * fattore sicurezza)
-        # Usiamo 0.7 per stare SICURAMENTE lontani dalle linee di arresto
-        min_dist = 10000.0
-        mapped_count = 0
-        for tl in lights:
-            d = tl.get_location().distance(self.center)
-            if d < min_dist: min_dist = d
+        box_tls = []
+        outside_tls = []
 
-            raw_yaw = utils.get_yaw(tl)
-            direction = utils.get_direction_label(raw_yaw)
-
-            if direction in self.light_groups:
-                self.light_groups[direction].append(tl)
-                mapped_count += 1
-                tl_loc = tl.get_location()
-                self.world.debug.draw_string(
-                    tl_loc + carla.Location(z=2.5),
-                    f"{direction}",
-                    draw_shadow=False,
-                    color=carla.Color(255, 255, 0),
-                    life_time=3600.0
-                )
-        
-        # Raggio ridotto per prendere solo chi è DAVVERO in mezzo
-        self.box_radius = max(5.0, min_dist * 0.6) # Ridotto da 0.7 a 0.6 per sicurezza
-        
-        self.state = 'GREEN'
-        self.current_phase_idx = 0
-        self.next_phase_idx = 0
-        self.last_change_time = 0.0
-        self._apply_lights_hard(self.current_phase_idx)
-
-        # Disegno area rilevamento
-        radius = config.EMERGENCY_DETECTION_DIST
-        num_segments = 24
-        angle_step = 360.0 / num_segments
-        color = carla.Color(200, 0, 0)
-        for i in range(num_segments):
-            angle1 = math.radians(i * angle_step)
-            angle2 = math.radians((i + 1) * angle_step)
-            p1_loc = carla.Location(x=self.center.x + math.cos(angle1) * radius,
-                                    y=self.center.y + math.sin(angle1) * radius, z=1.0)
-            p2_loc = carla.Location(x=self.center.x + math.cos(angle2) * radius,
-                                    y=self.center.y + math.sin(angle2) * radius, z=1.0)
-            world.debug.draw_line(p1_loc, p2_loc, thickness=0.2, color=color, life_time=3600.0)
-
-        # Debug visivo Box Junction (Giallo)
-        debug_z = 0.5
-        for i in range(num_segments):
-            angle1 = math.radians(i * angle_step)
-            angle2 = math.radians((i + 1) * angle_step)
-            p1 = carla.Location(self.center.x + math.cos(angle1) * self.box_radius, 
-                                self.center.y + math.sin(angle1) * self.box_radius, debug_z)
-            p2 = carla.Location(self.center.x + math.cos(angle2) * self.box_radius, 
-                                self.center.y + math.sin(angle2) * self.box_radius, debug_z)
-            world.debug.draw_line(p1, p2, thickness=0.3, color=carla.Color(255, 255, 0), life_time=3600.0)
-
-        utils.log(f"Incrocio {junction_id} inizializzato. Box Radius: {self.box_radius:.1f}m. Mappati {mapped_count}.")
-
-    def _apply_lights_hard(self, phase_idx):
-        green_dir = self.phase_to_dir.get(phase_idx, 'N')
-        for direction, lights in self.light_groups.items():
-            state = carla.TrafficLightState.Green if direction == green_dir else carla.TrafficLightState.Red
-            for tl in lights:
-                tl.set_state(state)
-                tl.freeze(True)
-
-    def _set_physical_lights(self, phase_idx, state):
-        target_dir = self.phase_to_dir.get(phase_idx, 'N')
-        for direction, lights in self.light_groups.items():
-            if direction == target_dir:
-                for tl in lights: tl.set_state(state)
+        # 2. Separali in base alla Bounding Box
+        for tl in all_tls:
+            if utils.is_point_in_box(tl.get_location()):
+                box_tls.append(tl)
             else:
-                if state == carla.TrafficLightState.Green:
-                    for tl in lights: tl.set_state(carla.TrafficLightState.Red)
+                outside_tls.append(tl)
 
-    def update(self, ai_requested_phase, now):
-        """
-        Gestisce la transizione dinamica.
-        L'IA decide la fase, ma l'incrocio gestisce la sicurezza e i tempi minimi.
-        """
-        elapsed = now - self.last_change_time
-        
-        # --- FASE VERDE (Estensibile dall'IA) ---
-        if self.state == 'GREEN':
-            # Se l'IA chiede la STESSA fase, estendiamo il verde (Tempo Dinamico)
-            if ai_requested_phase == self.current_phase_idx:
-                return # Rimaniamo verdi, lasciamo scorrere il traffico
-            
-            # Se l'IA chiede di cambiare:
-            # Rispettiamo un minimo vitale (es. 5s) per non fare sfarfallio
-            if elapsed >= config.MIN_GREEN_TIME:
-                self.next_phase_idx = ai_requested_phase
-                self._set_physical_lights(self.current_phase_idx, carla.TrafficLightState.Yellow)
-                self.state = 'YELLOW'
-                self.last_change_time = now
-        
-        # --- FASE GIALLA (Fissa per sicurezza) ---
-        elif self.state == 'YELLOW':
-            if elapsed >= config.YELLOW_TIME:
-                self._set_physical_lights(self.current_phase_idx, carla.TrafficLightState.Red)
-                self.state = 'ALL_RED'
-                self.last_change_time = now
-        
-        # --- FASE TUTTO ROSSO (Dinamica Anti-Blocco) ---
-        elif self.state == 'ALL_RED':
-            # 1. È passato il tempo tecnico di sicurezza?
-            if elapsed >= config.ALL_RED_TIME:
-                # 2. CONTROLLO CRITICO: L'incrocio è fisicamente libero?
-                # Se c'è un veicolo nel mezzo (is_blocked), estendiamo il rosso!
-                if self.is_blocked:
-                    # Rimaniamo in All Red. Non facciamo nulla.
-                    # Questo permette all'incrocio di svuotarsi prima di far entrare altri.
-                    pass 
-                else:
-                    # Via libera alla nuova fase scelta dall'IA
-                    self.current_phase_idx = self.next_phase_idx
-                    self._set_physical_lights(self.current_phase_idx, carla.TrafficLightState.Green)
-                    self.state = 'GREEN'
-                    self.last_change_time = now
+        # 3. GESTIONE SEMAFORI ESTERNI: Imposta SEMPRE VERDE
+        count_out = 0
+        for tl in outside_tls:
+            tl.set_state(carla.TrafficLightState.Green)
+            tl.freeze(True)
+            count_out += 1
 
-    def is_min_green_respected(self, now):
-        """
-        Ritorna True se l'incrocio è VERDE e sono passati almeno MIN_GREEN_TIME secondi.
-        """
-        if self.state != 'GREEN':
-            return False
-        return (now - self.last_change_time) >= config.MIN_GREEN_TIME
+        utils.log(f"DEBUG: {count_out} semafori FUORI dal box impostati su VERDE permanente.")
+        utils.log(f"DEBUG: Trovati {len(box_tls)} semafori DENTRO l'area da gestire.")
 
-    def get_sensors_data(self, vehicles_list, now):
-        queues = {'N': 0, 'S': 0, 'E': 0, 'O': 0}
-        wait_times = {'N': 0.0, 'S': 0.0, 'E': 0.0, 'O': 0.0}
-        emerg_wait_times = {'N': 0.0, 'S': 0.0, 'E': 0.0, 'O': 0.0} # [NEW]
-        emergencies = {'N': False, 'S': False, 'E': False, 'O': False}
-        emerg_keywords = ['police', 'ambulance', 'firetruck']
+        # 4. GESTIONE SEMAFORI INTERNI (Raggruppamento per Incroci)
+        groups = []
+        processed = set()
+        GROUP_DISTANCE = 45.0
 
-        current_stopped_ids = set()
-        
-        # Reset stato blocco
-        self.is_blocked = False
-        blocked_by_actor = None
+        for tl in box_tls:
+            if tl.id in processed: continue
+            current_group = [tl]
+            processed.add(tl.id)
+            tl_loc = tl.get_location()
+            for other in box_tls:
+                if other.id not in processed:
+                    if tl_loc.distance(other.get_location()) < GROUP_DISTANCE:
+                        current_group.append(other)
+                        processed.add(other.id)
+            groups.append(current_group)
 
-        for item in vehicles_list:
-            v = item['actor']
-            if not v.is_alive: continue
-            loc = v.get_location()
-            dist = loc.distance(self.center)
-            
-            # CHECK BOX JUNCTION: Se un veicolo è DENTRO il raggio critico e va piano, blocca l'incrocio.
-            # Nota: consideriamo "bloccato" se il veicolo è nell'area. Anche se si muove, è pericoloso cambiare.
-            if dist < self.box_radius:
-                self.is_blocked = True
-                blocked_by_actor = v.id
-
-            if dist > config.EMERGENCY_DETECTION_DIST: continue
-
-            vec = self.center - loc
-            dx, dy = vec.x, vec.y
-
-            # Logica geometrica (Indipendente dai semafori)
-            direction = ''
-            if abs(dx) > abs(dy):
-                direction = 'E' if dx < 0 else 'O'
+        idx_count = 0
+        for grp in groups:
+            if len(grp) >= config.MIN_LIGHTS_PER_JUNCTION:
+                self.intersections.append(SmartIntersection(idx_count, grp, self.world))
+                idx_count += 1
             else:
-                direction = 'N' if dy < 0 else 'S'
+                # Anche i gruppi spuri DENTRO il box vengono messi a verde
+                for tl in grp:
+                    tl.set_state(carla.TrafficLightState.Green)
+                    tl.freeze(True)
+        utils.log(f"Manager: Attivati {len(self.intersections)} incroci intelligenti.")
 
-            is_emerg_vehicle = any(kw in v.type_id for kw in emerg_keywords)
-            if is_emerg_vehicle:
-                fwd = v.get_transform().get_forward_vector()
-                dot = vec.x * fwd.x + vec.y * fwd.y
-                if dist > 0.1 and (dot / dist) > 0.5:
-                    emergencies[direction] = True
+    def run_step(self, vehicles_list, now):
+        world_state = []
+        for incrocio in self.intersections:
+            world_state.append(incrocio.get_sensors_data(vehicles_list, now))
 
-            speed = utils.vehicle_speed(v)
-            if speed < 4.0:
-                queues[direction] += 1
-                current_stopped_ids.add(v.id)
-                # Calcolo tempo attesa
-                if v.id not in self.vehicle_stop_times:
-                    self.vehicle_stop_times[v.id] = now
+        ai_decisions = ai_brain_decision(world_state)
+
+        for i, incrocio in enumerate(self.intersections):
+            incrocio.update(ai_decisions[i], now)
+
+        if now - self.last_print_time > 5.0:
+            print("-" * 50)
+            print(f"[REPORT 5s] Stato Traffico (Tempo: {now % 100:.1f}s)")
+            dir_names = ['N', 'S', 'E', 'O']
+            for i, data in enumerate(world_state):
+                q = data['queues']
+                w = data['wait_times']
+                curr_phase = dir_names[data['current_phase']]
+
+                # Info Logica per capire cosa sta succedendo
+                logic_msg = ""
+                if config.INVERT_DIRECTION_LOGIC:
+                    logic_msg = f"(Logica Inversa: Verde su {curr_phase} serve coda opposta)"
+
+                emerg_info = ""
+                for d, active in data['emergencies'].items():
+                    if active: emerg_info += f" [EMERGENZA DA {d}!]"
                 
-                waited = now - self.vehicle_stop_times[v.id]
-                if waited > wait_times[direction]:
-                    wait_times[direction] = waited
-                
-                # [NEW] Se è un veicolo di emergenza, tracciamo il suo tempo specifico
-                if is_emerg_vehicle:
-                     if waited > emerg_wait_times[direction]:
-                        emerg_wait_times[direction] = waited
+                # Format string for queues + waits
+                q_str = f"N={q['N']}({w['N']:.1f}s) S={q['S']}({w['S']:.1f}s) E={q['E']}({w['E']:.1f}s) O={q['O']}({w['O']:.1f}s)"
 
-        # Pulizia veicoli che non sono più fermi in zona
-        to_remove = [vid for vid in self.vehicle_stop_times if vid not in current_stopped_ids]
-        for vid in to_remove:
-            del self.vehicle_stop_times[vid]
-
-        return {
-            'queues': queues,
-            'wait_times': wait_times,
-            'emerg_wait_times': emerg_wait_times,  # [NEW] Tempo attesa specifico emergenze
-            'emergencies': emergencies,
-            'current_phase': self.current_phase_idx
-        }
-
-    def get_emergency_state(self, vehicles_data):
-        """
-        Controlla rapidamente se ci sono veicoli di emergenza in avvicinamento
-        su una delle 4 direzioni (N, S, E, O).
-        Restituisce un dizionario: {'N': False, 'S': True, ...}
-        """
-        emerg_state = {'N': False, 'S': False, 'E': False, 'O': False}
-        
-        # Se non abbiamo dati sui veicoli, ritorniamo tutto False
-        if not vehicles_data:
-            return emerg_state
-
-        for data in vehicles_data:
-            vehicle = data['actor']
-            if not vehicle.is_alive: 
-                continue
-
-            # 1. Filtro: È un veicolo di emergenza?
-            # Controlla se 'police', 'ambulance' o 'firetruck' sono nell'ID del blueprint
-            if not any(k in vehicle.type_id for k in ['police', 'ambulance', 'firetruck']):
-                continue
-
-            # 2. Controllo Distanza
-            veh_loc = vehicle.get_location()
-            dist = veh_loc.distance(self.center)
-            
-            # Consideriamo solo emergenze entro 50 metri
-            if dist > 50.0: 
-                continue
-
-            # 3. Controllo Direzione (si sta avvicinando o allontanando?)
-            # Calcoliamo il vettore dal veicolo al centro dell'incrocio
-            to_center = carla.Vector3D(self.center.x - veh_loc.x, self.center.y - veh_loc.y, 0)
-            fwd = vehicle.get_transform().get_forward_vector()
-            
-            # Prodotto scalare: se > 0, il veicolo sta guardando verso il centro
-            dot = fwd.x * to_center.x + fwd.y * to_center.y
-            
-            if dot < 0: 
-                continue # Si sta allontanando dall'incrocio, ignoralo
-
-            # 4. Determina geometricamente su quale braccio si trova (N, S, E, O)
-            dx = veh_loc.x - self.center.x
-            dy = veh_loc.y - self.center.y
-
-            direction = ''
-            # Se la differenza X è maggiore della Y, è sulla strada orizzontale
-            if abs(dx) > abs(dy):
-                # Se dx > 0 è a Est, se dx < 0 è a Ovest (O)
-                direction = 'E' if dx > 0 else 'O'
-            else:
-                # Strada verticale
-                # Se dy > 0 è a Sud, se dy < 0 è a Nord
-                direction = 'S' if dy > 0 else 'N'
-            
-            if direction in emerg_state:
-                emerg_state[direction] = True
-
-        return emerg_state
+                print(
+                    f"  > Incrocio {i} {logic_msg} | Code: {q_str}{emerg_info}")
+            print("-" * 50)
+            self.last_print_time = now

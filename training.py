@@ -166,25 +166,10 @@ class TrafficEnv:
         else:
             now = time.time()
 
-        real_action_list = list(action_tuple) # Convertiamo in lista modificabile
-        
-        # Recuperiamo i dati sensori attuali (senza avanzare il tempo)
-        # Nota: questo richiede che _get_state sia leggero o usiamo dati cachati
-        # Per semplicità, ipotizziamo di avere accesso a self.last_sensor_data aggiornato
-        
         for i, incrocio in enumerate(self.manager.intersections):
-             # Logica rapida per trovare emergenze
-             emergencies = incrocio.get_emergency_state(self.vehicles_data) # <--- Devi implementare questo metodo veloce in TrafficLightManager
-             
-             if any(emergencies.values()):
-                 # C'è un'emergenza! Troviamo quale direzione
-                 for phase_idx, direction in enumerate(['N', 'S', 'E', 'O']): # Mapping fase-direzione semplificato
-                     if emergencies[direction]:
-                         real_action_list[i] = phase_idx
-                         # print(f"EMERGENCY OVERRIDE: Incrocio {i} forzato a Fase {phase_idx}")
-                         break
-        
-        action_tuple = tuple(real_action_list)
+            if i < len(action_tuple):
+                incrocio.update(action_tuple[i], now)
+
         # 2. Loop di attesa dinamica
         # Continuiamo a simouvare finché non siamo pronti per la prossima decisione.
         # Condizione: TUTTI gli incroci devono essere GREEN e aver rispettato il MIN_GREEN_TIME.
@@ -514,14 +499,12 @@ class TrafficEnv:
         return False
 
     def _get_state(self):
-        # --- DEFINIZIONE DI 'NOW' (Mancava questo pezzo) ---
         if config.SYNCHRONOUS_MODE:
-            now = self.world.get_snapshot().timestamp.elapsed_seconds
+             now = self.world.get_snapshot().timestamp.elapsed_seconds
         else:
-            now = time.time()
-        # ---------------------------------------------------
-
+             now = time.time()
         state_vec = []
+
         target_intersections = 2
         current_data_list = []
 
@@ -529,80 +512,111 @@ class TrafficEnv:
             if i < len(self.manager.intersections):
                 incrocio = self.manager.intersections[i]
                 data = incrocio.get_sensors_data(self.vehicles_data, now)
-                
-                # Calcolo durata fase corrente
-                current_phase_duration = now - incrocio.last_change_time
                 phase_idx = data['current_phase']
             else:
-                # Dati dummy se manca l'incrocio
                 data = {
                     'queues': {'N': 0, 'S': 0, 'E': 0, 'O': 0},
                     'wait_times': {'N': 0, 'S': 0, 'E': 0, 'O': 0},
+                    'emergencies': {'N': False, 'S': False, 'E': False, 'O': False},
                     'current_phase': 0
                 }
-                current_phase_duration = 0.0
                 phase_idx = 0
 
+            # --- COSTRUZIONE VETTORE ---
             dirs = ['N', 'S', 'E', 'O']
 
-            # 1. Phase One-Hot (4 valori)
+            # 1. Stato (Phase One-Hot)
             phase_vec = [0.0] * 4
             phase_vec[phase_idx] = 1.0
             state_vec.extend(phase_vec)
 
-            # 2. Durata fase corrente (1 valore)
-            state_vec.append(min(current_phase_duration / 60.0, 1.0))
+            # 2. Wait Times (norm)
+            state_vec.extend([data['wait_times'][d] / 60.0 for d in dirs])
 
-            # 3. Wait Times normalizzati (logaritmici) (4 valori)
-            state_vec.extend([math.log(1 + data['wait_times'][d]) / 5.0 for d in dirs])
+            # 3. Veicoli Emergenza
+            state_vec.extend([1.0 if data['emergencies'][d] else 0.0 for d in dirs])
 
-            # 4. Lunghezza Coda (4 valori)
-            state_vec.extend([min(data['queues'][d] / 40.0, 1.0) for d in dirs])
+            # 4. Lunghezza Coda (norm)
+            state_vec.extend([data['queues'][d] / 20.0 for d in dirs])
 
             current_data_list.append(data)
 
         self.last_sensor_data = current_data_list
-        
-        # Dimensione totale vettore: (4 + 1 + 4 + 4) * 2 incroci = 26
         return np.array(state_vec, dtype=np.float32)
     
     def _compute_reward(self, delta_finished_cars):
-        """
-        Reward Strategy: Minimizzare la coda totale (Wait Weighted Queue Length).
-        Il reward è quasi sempre negativo. L'obiettivo è avvicinarsi a 0.
-        """
-        total_queue_length = 0.0
-        total_wait_time = 0.0
+        total_reward = 0.0
         
+        # --- CONFIGURAZIONE PESI ---
+        W_THROUGHPUT = 80.0       # Premio per ogni auto uscita
+        W_EMERGENCY  = 5000.0     # PRIORITÀ ASSOLUTA (Valore enorme)
+        W_PRESSURE   = 10.0       # Peso della logica code
+        
+        # --- 1. Throughput ---
+        total_reward += delta_finished_cars * W_THROUGHPUT
+
+        # --- Analisi Situazione ---
         current_data_list = self.last_sensor_data 
 
         for data in current_data_list:
             queues = data['queues']
             wait_times = data['wait_times']
+            emergencies = data['emergencies']
+            current_phase_idx = data['current_phase']
             
-            # Somma code (in metri o veicoli)
-            total_queue_length += sum(queues.values())
-            # Somma tempi attesa accumulati
-            total_wait_time += sum(wait_times.values())
+            phase_to_dir = {0: 'N', 1: 'S', 2: 'E', 3: 'O'}
+            green_dir = phase_to_dir.get(current_phase_idx, 'N')
+            
+            # --- 2. GESTIONE EMERGENZE (Override Totale) ---
+            any_emergency = False
+            for d, is_active in emergencies.items():
+                if is_active:
+                    any_emergency = True
+                    if d == green_dir:
+                        # Bravo! Hai dato verde all'ambulanza
+                        total_reward += 200.0 
+                    else:
+                        # DISASTRO! Ambulanza ferma al rosso.
+                        # Punizione tale da azzerare qualsiasi altro ragionamento.
+                        total_reward -= W_EMERGENCY
+            
+            # Se c'è un'emergenza gestita male, saltiamo la logica code (la priorità è solo quella)
+            if any_emergency:
+                continue
 
-        # FORMULA DEL REWARD
-        # Reward = - (Peso1 * Coda + Peso2 * Attesa)
-        # Se la coda è 0 e l'attesa è 0, il reward è 0 (Ottimo).
-        # Più alto è il traffico fermo, più negativo è il reward.
-        
-        r_queue = -0.5 * total_queue_length
-        r_wait = -0.5 * total_wait_time # Penalizziamo molto chi aspetta da tanto
-        
-        # Bonus piccolo se un'auto esce (per incoraggiare il throughput)
-        r_out = delta_finished_cars * 10.0
-        
-        # Penalty cambio fase (per evitare flickering continuo dei semafori)
-        # Questo richiede di tracciare se l'azione è cambiata rispetto allo step precedente
-        # r_change = -5.0 if action_changed else 0.0 (Opzionale)
+            # --- 3. LOGICA DI PRESSIONE (Gestione Code) ---
+            # Calcoliamo quante auto stiamo servendo (Outgoing) vs quante aspettano (Incoming)
+            
+            # Auto che stanno passando (sulla corsia verde)
+            # Se la coda è 0, stiamo servendo "il vuoto" -> Efficienza bassa
+            cars_served = queues[green_dir]
+            
+            # Auto che stanno aspettando (la peggiore delle corsie rosse)
+            max_waiting_red = 0
+            for d in ['N', 'S', 'E', 'O']:
+                if d != green_dir:
+                    if queues[d] > max_waiting_red:
+                        max_waiting_red = queues[d]
+            
+            # PRESSIONE = (Chi aspetta) - (Chi passa)
+            # Esempio Sbagliato: Aspettano 10, Passano 0. Pressione = 10 (Punizione alta)
+            # Esempio Giusto: Aspettano 2, Passano 15. Pressione = -13 (Premio)
+            pressure = max_waiting_red - cars_served
+            
+            # Applichiamo la punizione basata sulla pressione
+            total_reward -= (pressure * W_PRESSURE)
 
-        total_reward = r_queue + r_wait + r_out
-        
-        # Normalizzazione (opzionale, per stabilità gradienti)
+            # --- 4. SPRECO DI TEMPO (Verde Vuoto) ---
+            # Se ho il verde ma non c'è coda, e altrove c'è gente, punizione extra immediata
+            if cars_served == 0 and max_waiting_red > 0:
+                total_reward -= 50.0
+
+            # --- 5. LIMITE ATTESA MASSIMA ---
+            # Anche se la pressione suggerisce di non cambiare, non lasciare nessuno > 90s
+            for d in ['N', 'S', 'E', 'O']:
+                if wait_times[d] > 90.0:
+                    total_reward -= 100.0 # Punizione per "dimenticanza"
+
         return total_reward / 100.0
 # ==============================================================================
 # REPLAY BUFFER & AGENT

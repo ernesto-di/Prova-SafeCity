@@ -1,101 +1,126 @@
 import carla
 import config
 import utils
-from smart_intersection import SmartIntersection
-from ai_logic import ai_brain_decision
 
-class TrafficLightManager:
-    def __init__(self, world):
+class SmartIntersection:
+    def __init__(self, id, lights, world):
+        self.id = id
         self.world = world
-        self.intersections = []
-        self.last_print_time = 0
-        self._scan_intersections()
+        self.lights = lights
+        
+        # Calcolo centro incrocio (media posizioni semafori)
+        if len(lights) > 0:
+            avg_x = sum([l.get_location().x for l in lights]) / len(lights)
+            avg_y = sum([l.get_location().y for l in lights]) / len(lights)
+            self.center = carla.Location(x=avg_x, y=avg_y, z=0.0)
+        else:
+            self.center = carla.Location(0,0,0)
 
-    def _scan_intersections(self):
-        # 1. Recupera TUTTI i semafori della mappa
-        all_tls = self.world.get_actors().filter('traffic.traffic_light')
+        # Raggruppa semafori per direzione
+        self.light_groups = {'N': [], 'S': [], 'E': [], 'O': []}
+        for tl in lights:
+            yaw = utils.get_yaw(tl)
+            d = utils.get_direction_label(yaw)
+            self.light_groups[d].append(tl)
 
-        box_tls = []
-        outside_tls = []
+        self.phases = ['N', 'S', 'E', 'O']
+        self.current_phase_idx = 0 
+        self.next_phase_idx = 0
+        self.state = 'GREEN' # GREEN, YELLOW, RED_TRANSITION
+        self.last_change_time = 0.0
+        
+        # Inizializza semafori
+        self._apply_lights_hard(self.current_phase_idx)
+        
+        # Memoria tempi di attesa per veicoli
+        self.vehicle_stop_times = {} 
 
-        # 2. Separali in base alla Bounding Box
-        for tl in all_tls:
-            if utils.is_point_in_box(tl.get_location()):
-                box_tls.append(tl)
+    def update(self, action_idx, now):
+        """Gestisce la macchina a stati del semaforo (Giallo -> Rosso -> Verde)"""
+        if self.state == 'GREEN':
+            # Se l'azione è diversa dalla fase attuale E il tempo minimo è passato
+            if action_idx != self.current_phase_idx and self.is_min_green_respected(now):
+                self.next_phase_idx = action_idx
+                self.state = 'YELLOW'
+                self.last_change_time = now
+                self._set_lights(self.current_phase_idx, carla.TrafficLightState.Yellow)
+        
+        elif self.state == 'YELLOW':
+            if now - self.last_change_time > config.YELLOW_TIME:
+                self.state = 'RED_TRANSITION'
+                self.last_change_time = now
+                self._set_lights(self.current_phase_idx, carla.TrafficLightState.Red)
+        
+        elif self.state == 'RED_TRANSITION':
+            if now - self.last_change_time > config.ALL_RED_TIME:
+                self.current_phase_idx = self.next_phase_idx
+                self.state = 'GREEN'
+                self.last_change_time = now
+                self._apply_lights_hard(self.current_phase_idx)
+
+    def _apply_lights_hard(self, green_idx):
+        """Forza i semafori allo stato desiderato (senza transizione)"""
+        green_dir = self.phases[green_idx]
+        for d, group in self.light_groups.items():
+            state = carla.TrafficLightState.Green if d == green_dir else carla.TrafficLightState.Red
+            for tl in group:
+                tl.set_state(state)
+    
+    def _set_lights(self, phase_idx, state):
+        """Imposta lo stato di un gruppo specifico"""
+        direction = self.phases[phase_idx]
+        for tl in self.light_groups[direction]:
+            tl.set_state(state)
+
+    def is_min_green_respected(self, now):
+        return (now - self.last_change_time) > config.MIN_GREEN_TIME
+
+    def get_sensors_data(self, vehicles, now):
+        """Scansiona veicoli vicini per calcolare code e attese"""
+        data = {
+            'queues': {'N':0, 'S':0, 'E':0, 'O':0},
+            'wait_times': {'N':0.0, 'S':0.0, 'E':0.0, 'O':0.0},
+            'emergencies': {'N':False, 'S':False, 'E':False, 'O':False},
+            'current_phase': self.current_phase_idx
+        }
+        
+        # Rilevamento raggio d'azione dell'incrocio (es. 60 metri)
+        DETECTION_DIST = 60.0
+
+        for v_data in vehicles:
+            actor = v_data['actor']
+            if not actor.is_alive: continue
+            
+            # Filtro distanza
+            loc = actor.get_location()
+            if loc.distance(self.center) > DETECTION_DIST: 
+                continue 
+            
+            # Identifica direzione veicolo
+            v_yaw = utils.get_yaw(actor)
+            v_dir = utils.get_direction_label(v_yaw)
+            
+            # Check Emergenza
+            type_id = actor.type_id
+            is_emergency = ('ambulance' in type_id or 'police' in type_id or 'firetruck' in type_id)
+
+            # Check se fermo (Stop Time)
+            vel = utils.vehicle_speed(actor)
+            wait = 0.0
+            if vel < 0.5: # Considerato fermo
+                if actor.id not in self.vehicle_stop_times:
+                    self.vehicle_stop_times[actor.id] = now
+                wait = now - self.vehicle_stop_times[actor.id]
             else:
-                outside_tls.append(tl)
+                # Se si muove, resetta il timer
+                self.vehicle_stop_times.pop(actor.id, None)
+            
+            # Aggiorna statistiche
+            data['queues'][v_dir] += 1
+            if wait > data['wait_times'][v_dir]:
+                 data['wait_times'][v_dir] = wait
+            if is_emergency:
+                data['emergencies'][v_dir] = True
 
-        # 3. GESTIONE SEMAFORI ESTERNI: Imposta SEMPRE VERDE
-        count_out = 0
-        for tl in outside_tls:
-            tl.set_state(carla.TrafficLightState.Green)
-            tl.freeze(True)
-            count_out += 1
-
-        utils.log(f"DEBUG: {count_out} semafori FUORI dal box impostati su VERDE permanente.")
-        utils.log(f"DEBUG: Trovati {len(box_tls)} semafori DENTRO l'area da gestire.")
-
-        # 4. GESTIONE SEMAFORI INTERNI (Raggruppamento per Incroci)
-        groups = []
-        processed = set()
-        GROUP_DISTANCE = 45.0
-
-        for tl in box_tls:
-            if tl.id in processed: continue
-            current_group = [tl]
-            processed.add(tl.id)
-            tl_loc = tl.get_location()
-            for other in box_tls:
-                if other.id not in processed:
-                    if tl_loc.distance(other.get_location()) < GROUP_DISTANCE:
-                        current_group.append(other)
-                        processed.add(other.id)
-            groups.append(current_group)
-
-        idx_count = 0
-        for grp in groups:
-            if len(grp) >= config.MIN_LIGHTS_PER_JUNCTION:
-                self.intersections.append(SmartIntersection(idx_count, grp, self.world))
-                idx_count += 1
-            else:
-                # Anche i gruppi spuri DENTRO il box vengono messi a verde
-                for tl in grp:
-                    tl.set_state(carla.TrafficLightState.Green)
-                    tl.freeze(True)
-        utils.log(f"Manager: Attivati {len(self.intersections)} incroci intelligenti.")
-
-    def run_step(self, vehicles_list, now):
-        world_state = []
-        for incrocio in self.intersections:
-            world_state.append(incrocio.get_sensors_data(vehicles_list, now))
-
-        ai_decisions = ai_brain_decision(world_state)
-
-        for i, incrocio in enumerate(self.intersections):
-            incrocio.update(ai_decisions[i], now)
-
-        if now - self.last_print_time > 5.0:
-            print("-" * 50)
-            print(f"[REPORT 5s] Stato Traffico (Tempo: {now % 100:.1f}s)")
-            dir_names = ['N', 'S', 'E', 'O']
-            for i, data in enumerate(world_state):
-                q = data['queues']
-                w = data['wait_times']
-                curr_phase = dir_names[data['current_phase']]
-
-                # Info Logica per capire cosa sta succedendo
-                logic_msg = ""
-                if config.INVERT_DIRECTION_LOGIC:
-                    logic_msg = f"(Logica Inversa: Verde su {curr_phase} serve coda opposta)"
-
-                emerg_info = ""
-                for d, active in data['emergencies'].items():
-                    if active: emerg_info += f" [EMERGENZA DA {d}!]"
-                
-                # Format string for queues + waits
-                q_str = f"N={q['N']}({w['N']:.1f}s) S={q['S']}({w['S']:.1f}s) E={q['E']}({w['E']:.1f}s) O={q['O']}({w['O']:.1f}s)"
-
-                print(
-                    f"  > Incrocio {i} {logic_msg} | Code: {q_str}{emerg_info}")
-            print("-" * 50)
-            self.last_print_time = now
+        return data
+        
